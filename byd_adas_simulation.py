@@ -14,13 +14,24 @@ CLASS_NAMES = {
     15: "Gato",
     16: "Perro"
 }
+
 # -------------------------------------------------------------
-# 1. Lector de Cámara Asíncrono
+# 1. Lector de Cámara Asíncrono con Blindaje de Errores
 # -------------------------------------------------------------
 class AsyncCamera:
     def __init__(self, src, name="Camera"):
         self.name = name
+        self.src = src
         self.cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
+        self.stopped = False
+        self.ret = False
+        self.frame = None
+        
+        if not self.cap.isOpened():
+            print(f"[ERROR] No se pudo abrir la cámara '{self.name}' en /dev/video{src}")
+            self.stopped = True
+            return
+
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -28,24 +39,28 @@ class AsyncCamera:
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         
         self.ret, self.frame = self.cap.read()
-        self.stopped = False
         
         self.thread = threading.Thread(target=self._update, daemon=True)
         self.thread.start()
 
     def _update(self):
         while not self.stopped:
+            if not self.cap.isOpened():
+                break
             ret, frame = self.cap.read()
-            if ret:
+            if ret and frame is not None:
                 self.ret, self.frame = ret, frame
             time.sleep(0.005) 
 
     def read(self):
-        return self.ret, self.frame.copy() if self.frame is not None else None
+        if not self.ret or self.frame is None:
+            return False, None
+        return self.ret, self.frame.copy()
 
     def release(self):
         self.stopped = True
-        self.cap.release()
+        if self.cap.isOpened():
+            self.cap.release()
 
 # -------------------------------------------------------------
 # 2. Renderizado de Cubos 3D con Etiqueta de Nombre
@@ -54,11 +69,11 @@ def draw_3d_cuboid(img, x1, y1, x2, y2, color=(0, 255, 0), scale=0.20, label="")
     w, h = x2 - x1, y2 - y1
     dx, dy = int(w * scale), int(h * scale)
     
-    # Vertices Cara Frontal
+    # Vértices Cara Frontal
     f_tl, f_tr = (x1, y1), (x2, y1)
     f_bl, f_br = (x1, y2), (x2, y2)
     
-    # Vertices Cara Trasera (Perspectiva 3D)
+    # Vértices Cara Trasera (Perspectiva 3D)
     b_tl, b_tr = (x1 + dx, y1 - dy), (x2 - dx, y1 - dy)
     b_bl, b_br = (x1 + dx, y2 - dy), (x2 - dx, y2 - dy)
     
@@ -78,7 +93,6 @@ def draw_3d_cuboid(img, x1, y1, x2, y2, color=(0, 255, 0), scale=0.20, label="")
         text_w, text_h = text_size
         top_y = max(y1 - dy - 5, 15)
         
-        # Fondo para el texto
         cv2.rectangle(img, (x1, top_y - text_h - 4), (x1 + text_w + 6, top_y + 2), (0, 0, 0), -1)
         cv2.putText(img, label, (x1 + 3, top_y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
@@ -96,10 +110,8 @@ def inference_worker(model, cam_front, cam_rear, target_classes):
         ret_f, frame_front = cam_front.read()
         ret_r, frame_rear = cam_rear.read()
         
-        if ret_f and ret_r:
+        if ret_f and frame_front is not None:
             res_f = model(frame_front, imgsz=320, verbose=False)[0]
-            res_r = model(frame_rear, imgsz=320, verbose=False)[0]
-            
             temp_front = []
             for box in res_f.boxes:
                 cls = int(box.cls[0])
@@ -109,7 +121,10 @@ def inference_worker(model, cam_front, cam_rear, target_classes):
                     rel_x = (foot_x - 320) * 0.5
                     rel_y = 70 + (480 - foot_y) * 0.75
                     temp_front.append((x1, y1, x2, y2, rel_x, rel_y, cls))
-                    
+            latest_front_objects = temp_front
+
+        if ret_r and frame_rear is not None:
+            res_r = model(frame_rear, imgsz=320, verbose=False)[0]
             temp_rear = []
             for box in res_r.boxes:
                 cls = int(box.cls[0])
@@ -119,11 +134,9 @@ def inference_worker(model, cam_front, cam_rear, target_classes):
                     rel_x = (320 - foot_x) * 0.5
                     rel_y = -70 - (480 - foot_y) * 0.75
                     temp_rear.append((x1, y1, x2, y2, rel_x, rel_y, cls))
-            
-            latest_front_objects = temp_front
             latest_rear_objects = temp_rear
-        else:
-            time.sleep(0.01)
+            
+        time.sleep(0.005)
 
 # -------------------------------------------------------------
 # 4. Hilo Principal
@@ -135,7 +148,8 @@ def main():
     model = YOLO("yolov8n_openvino_model/")
     TARGET_CLASSES = list(CLASS_NAMES.keys())
 
-    cam_front = AsyncCamera(2, "Frontal")
+    # AJUSTA AQUÍ LOS ÍNDICES SEGÚN TU SISTEMA (Nodos pares: 0, 2, 4...)
+    cam_front = AsyncCamera(3, "Frontal")
     cam_rear = AsyncCamera(5, "Trasera")
 
     ai_thread = threading.Thread(
@@ -152,8 +166,16 @@ def main():
         ret_f, frame_front = cam_front.read()
         ret_r, frame_rear = cam_rear.read()
 
-        if not ret_f or not ret_r:
-            continue
+        # Generar cuadros vacíos si la cámara no está disponible para no colapsar el programa
+        if not ret_f or frame_front is None:
+            frame_front = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(frame_front, "CAMARA FRONTAL NO DISPONIBLE", (40, 240), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+        if not ret_r or frame_rear is None:
+            frame_rear = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(frame_rear, "CAMARA TRASERA NO DISPONIBLE", (40, 240), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
         dashboard = np.zeros((CANVAS_H, CANVAS_W, 3), dtype=np.uint8)
         dashboard[:] = (20, 24, 33)
