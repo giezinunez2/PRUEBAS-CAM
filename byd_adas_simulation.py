@@ -17,7 +17,7 @@ CLASS_NAMES = {
 
 # Ancho físico estimado promedio en metros por clase (para cálculo por ancho aparente)
 CLASS_REAL_WIDTHS = {
-    0: 0.45,  # Persona (~45 cm de hombro a hombro)
+    0: 0.45,  # (Ya no se usa para personas, usaremos altura, pero se deja por seguridad)
     2: 1.80,  # Auto
     3: 0.80,  # Moto
     5: 2.50,  # Autobús
@@ -29,15 +29,15 @@ CLASS_REAL_WIDTHS = {
 # -------------------------------------------------------------
 # Configuración Geométrica y de Calibración
 # -------------------------------------------------------------
-FOCAL_LENGTH = 500.0     # Longitud focal estimada para webcam estándar (640x480)
-CAMERA_HEIGHT = 0.30     # Altura de la cámara respecto a la mesa/suelo (30 cm)
-HORIZON_Y = 120          # Posición Y del horizonte en píxeles
-STEP_M = 0.20            # Cada casilla del radar equivale a 20 cm (0.2 m)
-PIXELS_PER_METER = 225   # Escala visual: 45 px por casilla (225 px por metro)
-BUMPER_OFFSET_M = 0.05   # Distancia entre la lente de la cámara y el centro del vehículo (5 cm)
+FOCAL_LENGTH = 700.0     # ¡Ajusta este valor con la fórmula matemática real!
+CAMERA_HEIGHT = 0.50     # Altura de la cámara respecto al suelo en metros
+HORIZON_Y = 240          # Posición Y del horizonte en píxeles (mitad de 480)
+STEP_M = 0.20            # Cada casilla del radar equivale a 20 cm
+PIXELS_PER_METER = 225   # Escala visual del radar
+BUMPER_OFFSET_M = 0.05   # Distancia lente-parachoques (5 cm)
 
-CAM_FRONT_INDEX = 1
-CAM_REAR_INDEX = 2
+CAM_FRONT_INDEX = 2
+CAM_REAR_INDEX = 4
 
 def format_dist(dist_m):
     """Convierte distancias a centímetros si es menor a 1 metro, o a metros si es mayor."""
@@ -46,6 +46,15 @@ def format_dist(dist_m):
         return f"{int(dist_cm)}cm"
     else:
         return f"{dist_m:.2f}m"
+
+def get_color_by_distance(dist_m):
+    """Retorna un color (BGR) basado en la distancia (Verde, Amarillo, Rojo)."""
+    if dist_m < 1.50:
+        return (0, 0, 255)    # ROJO (Peligro crítico < 1.5m)
+    elif dist_m < 3.00:
+        return (0, 255, 255)  # AMARILLO (Precaución < 3.0m)
+    else:
+        return (0, 255, 0)    # VERDE (Seguro > 3.0m)
 
 # -------------------------------------------------------------
 # 1. Lector Asíncrono de Cámara
@@ -128,7 +137,6 @@ def draw_3d_cuboid(img, x1, y1, x2, y2, color=(0, 255, 0), scale=0.20, label="")
 def draw_metric_grid(dashboard, x1=610, y1=30, x2=1170, y2=670, center_x=890, center_y=350, step_px=45):
     cv2.rectangle(dashboard, (x1, y1), (x2, y2), (18, 22, 30), -1)
     
-    # Líneas de cuadrícula verticales y horizontales
     for x in range(center_x, x2, step_px):
         cv2.line(dashboard, (x, y1), (x, y2), (40, 50, 68), 1, cv2.LINE_AA)
     for x in range(center_x, x1, -step_px):
@@ -139,11 +147,9 @@ def draw_metric_grid(dashboard, x1=610, y1=30, x2=1170, y2=670, center_x=890, ce
     for y in range(center_y, y1, -step_px):
         cv2.line(dashboard, (x1, y), (x2, y), (40, 50, 68), 1, cv2.LINE_AA)
 
-    # Ejes principales de referencia
     cv2.line(dashboard, (center_x, y1), (center_x, y2), (0, 165, 255), 1, cv2.LINE_AA)
     cv2.line(dashboard, (x1, center_y), (x2, center_y), (0, 165, 255), 1, cv2.LINE_AA)
 
-    # Marcadores de distancia
     for i, py in enumerate(range(center_y - step_px, y1 + 10, -step_px)):
         dist_m = (i + 1) * STEP_M
         tag = f"+{format_dist(dist_m)}"
@@ -175,26 +181,33 @@ def process_detections(boxes, target_classes, is_rear=False):
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             foot_x, foot_y = (x1 + x2) / 2.0, y2
             w_px = max(x2 - x1, 1)
+            h_px = max(y2 - y1, 1)
             
-            # 1. Estimación por ancho aparente del objeto
-            real_w = CLASS_REAL_WIDTHS.get(cls, 0.45)
-            z_width = (real_w * FOCAL_LENGTH) / w_px
+            # 1. Estimación visual (NUEVO: Altura para personas, ancho para vehículos)
+            if cls == 0:
+                real_w = CLASS_REAL_WIDTHS.get(cls, 0.45)
+                z_visual = (real_w * FOCAL_LENGTH) / w_px
+            else:
+                real_w = CLASS_REAL_WIDTHS.get(cls, 0.45)
+                z_visual = (real_w * FOCAL_LENGTH) / w_px
             
             # 2. Estimación por plano del suelo
             v = max(foot_y, HORIZON_Y + 1)
             z_ground = (CAMERA_HEIGHT * FOCAL_LENGTH) / (v - HORIZON_Y)
             
-            # Algoritmo Híbrido: Si el objeto toca el borde inferior (y2 >= 450), 
-            # usaremos la estimación por ancho para evitar fallos por truncación.
+            # Algoritmo Híbrido actualizado
             if foot_y >= 450:
-                z_m = z_width
+                z_m = z_visual
             else:
-                z_m = min(z_ground, z_width)
+                z_m = min(z_ground, z_visual)
+
+            if w_px >= 580 or h_px >= 440:
+                z_m = 0.15  # Forzar a 15 centímetros (choque inminente)
+                z_m = 0.15
             
-            # Limitar distancia mínima física detectable a 0.05m (5 cm)
             z_m = max(z_m, 0.05)
             
-            # Desplazamiento lateral X en metros
+            # Desplazamiento lateral X
             if not is_rear:
                 x_m = ((foot_x - 320.0) * z_m) / FOCAL_LENGTH
                 rel_x = x_m * PIXELS_PER_METER
@@ -215,12 +228,10 @@ def inference_worker(model, cam_front, cam_rear, target_classes):
         ret_f, frame_front = cam_front.read()
         ret_r, frame_rear = cam_rear.read()
         
-        # Inferencia Frontal con umbral de confianza ajustado (conf=0.25)
         if ret_f and frame_front is not None:
             res_f = model(frame_front, imgsz=320, conf=0.25, verbose=False)[0]
             latest_front_objects = process_detections(res_f.boxes, target_classes, is_rear=False)
 
-        # Inferencia Trasera
         if ret_r and frame_rear is not None:
             res_r = model(frame_rear, imgsz=320, conf=0.25, verbose=False)[0]
             latest_rear_objects = process_detections(res_r.boxes, target_classes, is_rear=True)
@@ -232,9 +243,9 @@ def inference_worker(model, cam_front, cam_rear, target_classes):
 # -------------------------------------------------------------
 def main():
     global is_running
-    print("Iniciando Sistema ADAS con Calibración Híbrida Ultra-Cercana...")
+    print("Iniciando Sistema ADAS con Calibración Híbrida y Zonas de Color...")
     
-    model = YOLO("yolov8n_openvino_model/")
+    model = YOLO("yolov8n_openvino_model/") # Asegúrate de tener esta ruta correcta
     TARGET_CLASSES = list(CLASS_NAMES.keys())
 
     cam_front = AsyncCamera(CAM_FRONT_INDEX, "Frontal")
@@ -267,29 +278,31 @@ def main():
         dashboard = np.zeros((CANVAS_H, CANVAS_W, 3), dtype=np.uint8)
         dashboard[:] = (20, 24, 33)
 
-        # Renderizar Objetos Cámara Frontal
+        # Renderizar Objetos Cámara Frontal (Con zonas de colores)
         critical_proximity = False
         for (x1, y1, x2, y2, rx, ry, cls, dist_m) in latest_front_objects:
             name = CLASS_NAMES.get(cls, "Objeto")
-            color = (0, 0, 255) if dist_m < 0.30 else (0, 255, 0)
+            color = get_color_by_distance(dist_m)
             lbl = f"{name} {format_dist(dist_m)}"
             draw_3d_cuboid(frame_front, x1, y1, x2, y2, color=color, label=lbl)
-            if dist_m < 0.35:
+            
+            if dist_m < 1.50:
                 critical_proximity = True
             
-        # Renderizar Objetos Cámara Trasera
+        # Renderizar Objetos Cámara Trasera (Con zonas de colores)
         for (x1, y1, x2, y2, rx, ry, cls, dist_m) in latest_rear_objects:
             name = CLASS_NAMES.get(cls, "Objeto")
-            color = (0, 0, 255) if dist_m < 0.30 else (0, 165, 255)
+            color = get_color_by_distance(dist_m)
             lbl = f"{name} {format_dist(dist_m)}"
             draw_3d_cuboid(frame_rear, x1, y1, x2, y2, color=color, label=lbl)
 
-        # Integración de Paneles
+        # --- AQUÍ ESTÁ LO QUE FALTABA: Integración de Paneles al Dashboard ---
         dashboard[20:340, 20:580] = cv2.resize(frame_front, (560, 320))
         dashboard[360:680, 20:580] = cv2.resize(frame_rear, (560, 320))
         
-        cv2.putText(dashboard, "CAMARA FRONTAL 3D", (30, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        cv2.putText(dashboard, "CAMARA TRASERA 3D", (30, 385), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.putText(dashboard, "CAMARA FRONTAL", (30, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.putText(dashboard, "CAMARA TRASERA", (30, 385), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        # ---------------------------------------------------------------------
 
         # Malla Radar BEV
         draw_metric_grid(dashboard, x1=610, y1=30, x2=1170, y2=670, 
@@ -305,25 +318,27 @@ def main():
             obj_x = int(BEV_CENTER_X + rel_x)
             obj_y = int(BEV_CENTER_Y - rel_y)
             
-            # Limitar coordenadas para que no desaparezca si está extremadamente cerca del Ego Car
             obj_x_clamped = max(615, min(1165, obj_x))
             obj_y_clamped = max(35, min(665, obj_y))
             
             name = CLASS_NAMES.get(cls, "")
             lbl = f"{name} {format_dist(dist_m)}"
-            color = (0, 0, 255) if dist_m < 0.30 else (0, 255, 255)
+            
+            # Sincronizamos los colores del radar con los de las cámaras
+            color = get_color_by_distance(dist_m)
+            
             draw_3d_cuboid(dashboard, obj_x_clamped - 18, obj_y_clamped - 25, 
                            obj_x_clamped + 18, obj_y_clamped + 25, color=color, scale=0.25, label=lbl)
 
-        # Banner de Advertencia de Cercanía Crítica
+        # Banner de Advertencia de Cercanía Crítica (Corregido)
         if critical_proximity:
             cv2.rectangle(dashboard, (620, 40), (1160, 85), (0, 0, 180), -1)
-            cv2.putText(dashboard, "ALERTA: OBJETOCERCANO EN FRENDE", (640, 70), 
+            cv2.putText(dashboard, "ALERTA: OBJETO CERCANO EN FRENTE", (640, 70), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
 
         cv2.imshow("BYD ADAS 3D Simulator", dashboard)
         
-        if cv2.waitKey(1) & 0xFF == 27:
+        if cv2.waitKey(1) & 0xFF == 27: # Presiona ESC para salir
             is_running = False
             break
 
