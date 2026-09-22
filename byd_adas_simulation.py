@@ -4,40 +4,32 @@ import threading
 import time
 from ultralytics import YOLO
 
-# Mapeo de IDs de COCO a nombres en español
-CLASS_NAMES = {
-    0: "Persona",
-    2: "Auto",
-    3: "Moto",
-    5: "Autobus",
-    7: "Camion",
-    15: "Gato",
-    16: "Perro"
-}
-
-# Ancho físico estimado promedio en metros por clase (para cálculo por ancho aparente)
+# Ancho físico estimado promedio en metros por clase conocida.
+# Si el modelo detecta algo que no está aquí (ej. botella, silla, mochila), 
+# el código le asignará automáticamente 0.50m (50 cm) por defecto.
 CLASS_REAL_WIDTHS = {
-    0: 0.45,  # (Ya no se usa para personas, usaremos altura, pero se deja por seguridad)
+    0: 0.45,  # Persona (usado solo de respaldo, priorizamos altura)
     2: 1.80,  # Auto
     3: 0.80,  # Moto
     5: 2.50,  # Autobús
     7: 2.50,  # Camión
     15: 0.25, # Gato
-    16: 0.35  # Perro
+    16: 0.35, # Perro
+    39: 0.07  # Botella
 }
 
 # -------------------------------------------------------------
 # Configuración Geométrica y de Calibración
 # -------------------------------------------------------------
-FOCAL_LENGTH = 700.0     # ¡Ajusta este valor con la fórmula matemática real!
+FOCAL_LENGTH = 700.0     # ¡Ajusta este valor con la fórmula matemática real para tu cámara!
 CAMERA_HEIGHT = 0.50     # Altura de la cámara respecto al suelo en metros
 HORIZON_Y = 240          # Posición Y del horizonte en píxeles (mitad de 480)
 STEP_M = 0.20            # Cada casilla del radar equivale a 20 cm
 PIXELS_PER_METER = 225   # Escala visual del radar
 BUMPER_OFFSET_M = 0.05   # Distancia lente-parachoques (5 cm)
 
-CAM_FRONT_INDEX = 2
-CAM_REAR_INDEX = 4
+CAM_FRONT_INDEX = 1
+CAM_REAR_INDEX = 2
 
 def format_dist(dist_m):
     """Convierte distancias a centímetros si es menor a 1 metro, o a metros si es mayor."""
@@ -173,55 +165,60 @@ latest_front_objects = []
 latest_rear_objects = []
 is_running = True
 
-def process_detections(boxes, target_classes, is_rear=False):
+def process_detections(boxes, model_names, is_rear=False):
     objects = []
     for box in boxes:
         cls = int(box.cls[0])
-        if cls in target_classes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            foot_x, foot_y = (x1 + x2) / 2.0, y2
-            w_px = max(x2 - x1, 1)
-            h_px = max(y2 - y1, 1)
+        name = model_names[cls]  # Obtenemos el nombre directamente de YOLO
+        
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        foot_x, foot_y = (x1 + x2) / 2.0, y2
+        w_px = max(x2 - x1, 1)
+        h_px = max(y2 - y1, 1)
+        
+        # 1. Estimación visual 
+        if cls == 0: 
+            real_h = 1.70  # Altura de persona
+            z_visual = (real_h * FOCAL_LENGTH) / h_px
+        else:
+            # MAGIA: Si no sabemos qué es, asumimos un ancho de 50 cm
+            real_w = CLASS_REAL_WIDTHS.get(cls, 0.50)
+            z_visual = (real_w * FOCAL_LENGTH) / w_px
+        
+        # 2. Estimación por plano del suelo
+        v = max(foot_y, HORIZON_Y + 1)
+        z_ground = (CAMERA_HEIGHT * FOCAL_LENGTH) / (v - HORIZON_Y)
+        
+        # Algoritmo Híbrido actualizado
+        if foot_y >= 450:
+            z_m = z_visual
+        else:
+            z_m = min(z_ground, z_visual)
             
-            # 1. Estimación visual (NUEVO: Altura para personas, ancho para vehículos)
-            if cls == 0:
-                real_w = CLASS_REAL_WIDTHS.get(cls, 0.45)
-                z_visual = (real_w * FOCAL_LENGTH) / w_px
-            else:
-                real_w = CLASS_REAL_WIDTHS.get(cls, 0.45)
-                z_visual = (real_w * FOCAL_LENGTH) / w_px
+        # --- PARCHE DE SATURACIÓN DE CÁMARA (TRUNCAMIENTO) ---
+        if w_px >= 580 or h_px >= 440:
+            z_m = 0.15  # Forzar colisión inminente si bloquea toda la pantalla
             
-            # 2. Estimación por plano del suelo
-            v = max(foot_y, HORIZON_Y + 1)
-            z_ground = (CAMERA_HEIGHT * FOCAL_LENGTH) / (v - HORIZON_Y)
+        # Limitar distancia mínima física detectable a 0.05m (5 cm)
+        z_m = max(z_m, 0.05)
+        
+        # Desplazamiento lateral X
+        if not is_rear:
+            x_m = ((foot_x - 320.0) * z_m) / FOCAL_LENGTH
+            rel_x = x_m * PIXELS_PER_METER
+            rel_y = (z_m + BUMPER_OFFSET_M) * PIXELS_PER_METER
+        else:
+            x_m = ((320.0 - foot_x) * z_m) / FOCAL_LENGTH
+            rel_x = x_m * PIXELS_PER_METER
+            rel_y = -(z_m + BUMPER_OFFSET_M) * PIXELS_PER_METER
             
-            # Algoritmo Híbrido actualizado
-            if foot_y >= 450:
-                z_m = z_visual
-            else:
-                z_m = min(z_ground, z_visual)
-
-            if w_px >= 580 or h_px >= 440:
-                z_m = 0.15  # Forzar a 15 centímetros (choque inminente)
-                z_m = 0.15
-            
-            z_m = max(z_m, 0.05)
-            
-            # Desplazamiento lateral X
-            if not is_rear:
-                x_m = ((foot_x - 320.0) * z_m) / FOCAL_LENGTH
-                rel_x = x_m * PIXELS_PER_METER
-                rel_y = (z_m + BUMPER_OFFSET_M) * PIXELS_PER_METER
-            else:
-                x_m = ((320.0 - foot_x) * z_m) / FOCAL_LENGTH
-                rel_x = x_m * PIXELS_PER_METER
-                rel_y = -(z_m + BUMPER_OFFSET_M) * PIXELS_PER_METER
-                
-            dist_total_m = z_m + BUMPER_OFFSET_M
-            objects.append((x1, y1, x2, y2, rel_x, rel_y, cls, dist_total_m))
+        dist_total_m = z_m + BUMPER_OFFSET_M
+        
+        # Guardamos la variable 'name' en lugar de 'cls'
+        objects.append((x1, y1, x2, y2, rel_x, rel_y, name, dist_total_m))
     return objects
 
-def inference_worker(model, cam_front, cam_rear, target_classes):
+def inference_worker(model, cam_front, cam_rear, model_names):
     global latest_front_objects, latest_rear_objects, is_running
     
     while is_running:
@@ -230,11 +227,11 @@ def inference_worker(model, cam_front, cam_rear, target_classes):
         
         if ret_f and frame_front is not None:
             res_f = model(frame_front, imgsz=320, conf=0.25, verbose=False)[0]
-            latest_front_objects = process_detections(res_f.boxes, target_classes, is_rear=False)
+            latest_front_objects = process_detections(res_f.boxes, model_names, is_rear=False)
 
         if ret_r and frame_rear is not None:
             res_r = model(frame_rear, imgsz=320, conf=0.25, verbose=False)[0]
-            latest_rear_objects = process_detections(res_r.boxes, target_classes, is_rear=True)
+            latest_rear_objects = process_detections(res_r.boxes, model_names, is_rear=True)
             
         time.sleep(0.005)
 
@@ -243,17 +240,17 @@ def inference_worker(model, cam_front, cam_rear, target_classes):
 # -------------------------------------------------------------
 def main():
     global is_running
-    print("Iniciando Sistema ADAS con Calibración Híbrida y Zonas de Color...")
+    print("Iniciando Sistema ADAS Universal (Detección Multi-Objeto)...")
     
-    model = YOLO("yolov8n_openvino_model/") # Asegúrate de tener esta ruta correcta
-    TARGET_CLASSES = list(CLASS_NAMES.keys())
-
+    model = YOLO("yolov8n_openvino_model/") # Cambiar a "yolov8n.pt" si no usas OpenVINO
+    
     cam_front = AsyncCamera(CAM_FRONT_INDEX, "Frontal")
     cam_rear = AsyncCamera(CAM_REAR_INDEX, "Trasera")
 
+    # Pasamos model.names para que reconozca los 80 objetos automáticamente
     ai_thread = threading.Thread(
         target=inference_worker, 
-        args=(model, cam_front, cam_rear, TARGET_CLASSES), 
+        args=(model, cam_front, cam_rear, model.names), 
         daemon=True
     )
     ai_thread.start()
@@ -278,31 +275,28 @@ def main():
         dashboard = np.zeros((CANVAS_H, CANVAS_W, 3), dtype=np.uint8)
         dashboard[:] = (20, 24, 33)
 
-        # Renderizar Objetos Cámara Frontal (Con zonas de colores)
+        # Renderizar Objetos Cámara Frontal
         critical_proximity = False
-        for (x1, y1, x2, y2, rx, ry, cls, dist_m) in latest_front_objects:
-            name = CLASS_NAMES.get(cls, "Objeto")
+        for (x1, y1, x2, y2, rx, ry, obj_name, dist_m) in latest_front_objects:
             color = get_color_by_distance(dist_m)
-            lbl = f"{name} {format_dist(dist_m)}"
+            lbl = f"{obj_name.upper()} {format_dist(dist_m)}" # Traduce texto a mayúsculas
             draw_3d_cuboid(frame_front, x1, y1, x2, y2, color=color, label=lbl)
             
             if dist_m < 1.50:
                 critical_proximity = True
             
-        # Renderizar Objetos Cámara Trasera (Con zonas de colores)
-        for (x1, y1, x2, y2, rx, ry, cls, dist_m) in latest_rear_objects:
-            name = CLASS_NAMES.get(cls, "Objeto")
+        # Renderizar Objetos Cámara Trasera
+        for (x1, y1, x2, y2, rx, ry, obj_name, dist_m) in latest_rear_objects:
             color = get_color_by_distance(dist_m)
-            lbl = f"{name} {format_dist(dist_m)}"
+            lbl = f"{obj_name.upper()} {format_dist(dist_m)}"
             draw_3d_cuboid(frame_rear, x1, y1, x2, y2, color=color, label=lbl)
 
-        # --- AQUÍ ESTÁ LO QUE FALTABA: Integración de Paneles al Dashboard ---
+        # Integración de Paneles al Dashboard
         dashboard[20:340, 20:580] = cv2.resize(frame_front, (560, 320))
         dashboard[360:680, 20:580] = cv2.resize(frame_rear, (560, 320))
         
         cv2.putText(dashboard, "CAMARA FRONTAL", (30, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         cv2.putText(dashboard, "CAMARA TRASERA", (30, 385), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        # ---------------------------------------------------------------------
 
         # Malla Radar BEV
         draw_metric_grid(dashboard, x1=610, y1=30, x2=1170, y2=670, 
@@ -314,23 +308,20 @@ def main():
 
         # Proyección en Plano Top-Down BEV
         all_objects = latest_front_objects + latest_rear_objects
-        for (x1, y1, x2, y2, rel_x, rel_y, cls, dist_m) in all_objects:
+        for (x1, y1, x2, y2, rel_x, rel_y, obj_name, dist_m) in all_objects:
             obj_x = int(BEV_CENTER_X + rel_x)
             obj_y = int(BEV_CENTER_Y - rel_y)
             
             obj_x_clamped = max(615, min(1165, obj_x))
             obj_y_clamped = max(35, min(665, obj_y))
             
-            name = CLASS_NAMES.get(cls, "")
-            lbl = f"{name} {format_dist(dist_m)}"
-            
-            # Sincronizamos los colores del radar con los de las cámaras
+            lbl = f"{obj_name.upper()} {format_dist(dist_m)}"
             color = get_color_by_distance(dist_m)
             
             draw_3d_cuboid(dashboard, obj_x_clamped - 18, obj_y_clamped - 25, 
                            obj_x_clamped + 18, obj_y_clamped + 25, color=color, scale=0.25, label=lbl)
 
-        # Banner de Advertencia de Cercanía Crítica (Corregido)
+        # Banner de Advertencia de Cercanía Crítica
         if critical_proximity:
             cv2.rectangle(dashboard, (620, 40), (1160, 85), (0, 0, 180), -1)
             cv2.putText(dashboard, "ALERTA: OBJETO CERCANO EN FRENTE", (640, 70), 
@@ -338,7 +329,7 @@ def main():
 
         cv2.imshow("BYD ADAS 3D Simulator", dashboard)
         
-        if cv2.waitKey(1) & 0xFF == 27: # Presiona ESC para salir
+        if cv2.waitKey(1) & 0xFF == 27: # Presiona ESC en la ventana para salir de forma segura
             is_running = False
             break
 
