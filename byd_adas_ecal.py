@@ -29,6 +29,11 @@ except ImportError:
 print("Iniciando Modelo YOLOv8n...")
 model = YOLO("yolov8n.pt")
 
+# MEJORA: Warm-up del modelo para evitar el "freeze" inicial en la primera inferencia real
+_dummy = np.zeros((320, 320, 3), dtype=np.uint8)
+model(_dummy, verbose=False)
+print("Modelo YOLOv8n listo.")
+
 # Ancho físico estimado en metros para cálculo de distancia
 CLASS_REAL_WIDTHS = {
     0: 0.45,  # Persona
@@ -42,16 +47,32 @@ CLASS_REAL_WIDTHS = {
 }
 FOCAL_LENGTH = 700.0  # Calibración focal estimada
 
-# Variables globales para sincronización de hilos (Thread-Safe)
+# MEJORA: Parámetros de IA ajustables centralizados
+YOLO_IMG_SIZE = 320      # Antes 640 por defecto -> mucho más rápido en CPU
+YOLO_CONF_THRESH = 0.35  # Antes 0.4 -> detecta más objetos reales
+
+# --- Variables globales Thread-Safe ---
 latest_msg = None
-data_lock = threading.Lock()
+msg_lock = threading.Lock()
+
+# MEJORA: Buffers compartidos entre el hilo de IA y el hilo principal (desacoplados)
+latest_frame_front = None
+latest_frame_rear = None
+frame_lock = threading.Lock()
+
+latest_det_front = []   # [(x1,y1,x2,y2,cls_id,dist_m), ...]
+latest_det_rear = []
+det_lock = threading.Lock()
+
+is_running = True
+ai_fps = 0.0
 
 
 # --- 2. COMUNICACIÓN ECAL ---
 def ecal_callback(topic_name, msg, time_stamp):
     """Callback de eCAL para capturar los datos entrantes del bus."""
     global latest_msg
-    with data_lock:
+    with msg_lock:
         latest_msg = msg
 
 
@@ -80,26 +101,64 @@ def decode_frame(img_pb):
     return cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
 
-# --- 3. MOTOR GRÁFICO BEV 3D (VISTA DE PÁJARO) ---
+# --- 3. MOTOR GRÁFICO BEV 3D (TABLERO DE AJEDREZ COMO REFERENCIA CARTESIANA) ---
+PIXELS_PER_METER = 100     # Escala: 100 px = 1 metro
+CELL_METERS = 0.5          # MEJORA: tamaño de cada celda del "tablero de ajedrez"
+CELL_PX = int(PIXELS_PER_METER * CELL_METERS)
+
 def crear_panel_bev(alto, ancho, detecciones=[]):
-    """Genera la cuadrícula BEV graduada en metros con el EGO CAR central."""
+    """
+    Genera el panel BEV con un patrón tipo TABLERO DE AJEDREZ.
+    Cada celda representa CELL_METERS x CELL_METERS reales, sirviendo
+    como referencia visual de escala en el plano cartesiano (X, Z).
+    """
     panel = np.zeros((alto, ancho, 3), dtype=np.uint8)
     cx, cy = ancho // 2, alto // 2
 
-    # Líneas guía de ejes principales (Naranja/Marrón)
+    # MEJORA: Dibujar el tablero de ajedrez (celdas alternadas)
+    color_a = (32, 32, 32)   # celda oscura
+    color_b = (52, 52, 52)   # celda clara
+    cols = ancho // CELL_PX + 2
+    rows = alto // CELL_PX + 2
+
+    # Offset para que el tablero quede perfectamente centrado en el EGO CAR
+    offset_x = cx % CELL_PX
+    offset_y = cy % CELL_PX
+
+    for row in range(-1, rows):
+        for col in range(-1, cols):
+            x1 = col * CELL_PX + offset_x
+            y1 = row * CELL_PX + offset_y
+            x2 = x1 + CELL_PX
+            y2 = y1 + CELL_PX
+            if x2 < 0 or y2 < 0 or x1 > ancho or y1 > alto:
+                continue
+            # Índice de celda relativo al centro para alternar el color correctamente
+            idx_col = round((x1 - cx) / CELL_PX)
+            idx_row = round((y1 - cy) / CELL_PX)
+            color = color_a if (idx_col + idx_row) % 2 == 0 else color_b
+            cv2.rectangle(panel, (max(x1, 0), max(y1, 0)),
+                          (min(x2, ancho), min(y2, alto)), color, -1)
+
+    # MEJORA: Líneas mayores cada 1 metro (más brillantes) para lectura rápida
+    meter_px = PIXELS_PER_METER
+    for x in range(cx % meter_px, ancho, meter_px):
+        cv2.line(panel, (x, 0), (x, alto), (70, 70, 70), 1)
+    for y in range(cy % meter_px, alto, meter_px):
+        cv2.line(panel, (0, y), (ancho, y), (70, 70, 70), 1)
+
+    # Ejes principales (naranja) sobre el EGO CAR
     cv2.line(panel, (cx, 0), (cx, alto), (0, 140, 255), 1)
     cv2.line(panel, (0, cy), (ancho, cy), (0, 140, 255), 1)
 
-    # Cuadrícula y escala graduada de distancias (+1.20m, -1.20m, etc.)
-    for offset_y in range(-300, 320, 40):
-        y_pos = cy - offset_y
-        if 0 <= y_pos <= alto:
-            cv2.line(panel, (cx - 140, y_pos), (cx + 140, y_pos), (35, 35, 35), 1)
-            dist_m = offset_y / 100.0
-            cv2.putText(panel, f"{dist_m:+.2f}m", (cx + 145, y_pos + 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (160, 160, 160), 1)
+    # Etiquetas de distancia cada metro
+    for offset in range(-4, 5):
+        y_pos = cy - offset * meter_px
+        if 0 <= y_pos <= alto and offset != 0:
+            cv2.putText(panel, f"{offset:+d}m", (cx + 8, y_pos - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (170, 170, 170), 1)
 
-    # Dibujar Vehículo Propio (EGO CAR azul en el centro)
+    # Vehículo Propio (EGO CAR azul en el centro)
     car_w, car_h = 40, 70
     p1 = (cx - car_w // 2, cy - car_h // 2)
     p2 = (cx + car_w // 2, cy + car_h // 2)
@@ -109,15 +168,11 @@ def crear_panel_bev(alto, ancho, detecciones=[]):
 
     # Proyectar detecciones de la IA en la cuadrícula BEV
     for cls_id, dist_m, cam_type in detecciones:
-        # Convertir distancia en metros a posición en píxeles Y
-        px_y = int(cy - (dist_m * 100.0))
-
+        px_y = int(cy - (dist_m * PIXELS_PER_METER))
         if 0 <= px_y <= alto:
             box_w, box_h = 30, 30
             bx1, by1 = cx - box_w // 2, px_y - box_h // 2
             bx2, by2 = cx + box_w // 2, px_y + box_h // 2
-
-            # Recuadro amarillo para objetos detectados en BEV
             cv2.rectangle(panel, (bx1, by1), (bx2, by2), (0, 255, 255), 2)
             label = f"{model.names.get(cls_id, 'Obj')} {abs(dist_m):.2f}m"
             cv2.putText(panel, label, (bx1 - 15, by1 - 5),
@@ -127,59 +182,111 @@ def crear_panel_bev(alto, ancho, detecciones=[]):
 
 
 # --- 4. PROCESAMIENTO DE IA Y DISTANCIAS ---
-def procesar_ia(frame, cam_name):
-    """Ejecuta la inferencia YOLO y calcula las distancias reales."""
+def calcular_detecciones(boxes, cam_name):
+    """Convierte resultados de YOLO en lista de detecciones con distancia real."""
     detecciones = []
-    if frame is None:
-        return frame, detecciones
-
-    results = model(frame, verbose=False)[0]
-
-    for box in results.boxes:
+    for box in boxes:
         cls_id = int(box.cls[0])
         conf = float(box.conf[0])
 
-        if conf > 0.4 and cls_id in CLASS_REAL_WIDTHS:
+        if conf > YOLO_CONF_THRESH and cls_id in CLASS_REAL_WIDTHS:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             width_px = x2 - x1
-
             if width_px > 0:
                 real_w = CLASS_REAL_WIDTHS[cls_id]
                 dist_m = (real_w * FOCAL_LENGTH) / width_px
-
-                # Dibujar bounding box en la imagen de la cámara
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                label = f"{model.names[cls_id]} {dist_m:.2f}m"
-                cv2.putText(frame, label, (x1, y1 - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-                # Si es cámara trasera, la distancia en el mapa BEV es negativa
                 dist_bev = dist_m if cam_name == "FRONTAL" else -dist_m
-                detecciones.append((cls_id, dist_bev, cam_name))
+                detecciones.append((x1, y1, x2, y2, cls_id, dist_m, dist_bev))
+    return detecciones
 
-    # Superponer etiqueta de la cámara
+
+def dibujar_boxes(frame, detecciones, cam_name):
+    """Dibuja las cajas y etiquetas sobre el frame de la cámara."""
+    if frame is None:
+        return frame
+    for (x1, y1, x2, y2, cls_id, dist_m, dist_bev) in detecciones:
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        label = f"{model.names[cls_id]} {dist_m:.2f}m"
+        cv2.putText(frame, label, (x1, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
     cv2.putText(frame, f"CAMARA {cam_name}", (15, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    return frame, detecciones
+    return frame
 
 
-# --- 5. BUCLE PRINCIPAL Y RENDERING ---
+# --- 5. HILO DE INFERENCIA IA (DESACOPLADO DEL RENDER -> ELIMINA LATENCIA) ---
+def inference_worker():
+    """
+    MEJORA CLAVE DE LATENCIA:
+    Corre YOLO en un hilo independiente, en batch (frontal+trasera juntas),
+    a la velocidad máxima que la CPU permita, sin bloquear el refresco de video.
+    """
+    global latest_det_front, latest_det_rear, ai_fps
+
+    while is_running:
+        with frame_lock:
+            f_front = None if latest_frame_front is None else latest_frame_front.copy()
+            f_rear = None if latest_frame_rear is None else latest_frame_rear.copy()
+
+        if f_front is None and f_rear is None:
+            time.sleep(0.01)
+            continue
+
+        t0 = time.time()
+        batch = []
+        idx_map = []  # 'FRONTAL' o 'TRASERA' por posición del batch
+        if f_front is not None:
+            batch.append(f_front)
+            idx_map.append("FRONTAL")
+        if f_rear is not None:
+            batch.append(f_rear)
+            idx_map.append("TRASERA")
+
+        # MEJORA: una sola llamada batch en vez de dos llamadas separadas
+        results = model(batch, imgsz=YOLO_IMG_SIZE, conf=YOLO_CONF_THRESH, verbose=False)
+
+        det_f, det_r = [], []
+        n_detecciones = 0
+        for i, res in enumerate(results):
+            dets = calcular_detecciones(res.boxes, idx_map[i])
+            n_detecciones += len(dets)
+            if idx_map[i] == "FRONTAL":
+                det_f = dets
+            else:
+                det_r = dets
+
+        with det_lock:
+            latest_det_front = det_f
+            latest_det_rear = det_r
+
+        dt = time.time() - t0
+        ai_fps = 1.0 / dt if dt > 0 else 0.0
+
+        # MEJORA: diagnóstico en consola para saber si la IA realmente detecta algo
+        if n_detecciones == 0:
+            print(f"[IA] Sin detecciones este ciclo (FPS IA: {ai_fps:.1f}). "
+                  f"Si usas el patrón simulado (circulo), es normal: no es un objeto COCO real.")
+        else:
+            print(f"[IA] {n_detecciones} objeto(s) detectado(s) (FPS IA: {ai_fps:.1f})")
+
+
+# --- 6. BUCLE PRINCIPAL Y RENDERING ---
 def main():
-    global latest_msg
+    global latest_msg, latest_frame_front, latest_frame_rear, is_running
 
-    # Inicialización del nodo eCAL
     ecal_core.initialize("Python ADAS Subscriber")
     sub = ProtoSubscriber("trinocular_stream", trinocular_pb2.TripleVideoFrame)
     sub.set_callback(ecal_callback)
 
-    print("Receptor eCAL BYD ADAS Activo. Esperando flujo de datos...")
+    # MEJORA: lanzar el hilo de IA independiente del render
+    ai_thread = threading.Thread(target=inference_worker, daemon=True)
+    ai_thread.start()
 
-    frame_count = 0
-    last_detecciones = []
+    print("Receptor eCAL BYD ADAS Activo. Esperando flujo de datos...")
 
     while ecal_core.ok():
         msg = None
-        with data_lock:
+        with msg_lock:
             if latest_msg is not None:
                 msg = latest_msg
 
@@ -187,13 +294,10 @@ def main():
             time.sleep(0.005)
             continue
 
-        frame_count += 1
-
-        # Decodificación segura según la estructura Protobuf (center / right)
+        # Decodificación según la estructura Protobuf (center / right)
         frame_front = decode_frame(msg.center) if (hasattr(msg, "center") and msg.HasField("center")) else None
         frame_rear = decode_frame(msg.right) if (hasattr(msg, "right") and msg.HasField("right")) else (decode_frame(msg.left) if (hasattr(msg, "left") and msg.HasField("left")) else None)
 
-        # Ajustar dimensiones de cámaras a 640x480
         if frame_front is not None:
             frame_front = cv2.resize(frame_front, (640, 480))
         else:
@@ -204,33 +308,43 @@ def main():
         else:
             frame_rear = np.zeros((480, 640, 3), dtype=np.uint8)
 
-        # Optimización anti-latencia: Ejecutar IA cada 2 fotogramas
-        if frame_count % 2 == 0:
-            frame_front, det_f = procesar_ia(frame_front, "FRONTAL")
-            frame_rear, det_r = procesar_ia(frame_rear, "TRASERA")
-            last_detecciones = det_f + det_r
-        else:
-            cv2.putText(frame_front, "CAMARA FRONTAL", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(frame_rear, "CAMARA TRASERA", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        # MEJORA: entregar los frames actuales al hilo de IA (sin bloquear el render)
+        with frame_lock:
+            latest_frame_front = frame_front.copy()
+            latest_frame_rear = frame_rear.copy()
+
+        # MEJORA: usar las últimas detecciones disponibles (aunque vengan de un frame anterior)
+        with det_lock:
+            det_f = list(latest_det_front)
+            det_r = list(latest_det_rear)
+
+        frame_front = dibujar_boxes(frame_front, det_f, "FRONTAL")
+        frame_rear = dibujar_boxes(frame_rear, det_r, "TRASERA")
+
+        detecciones_bev = [(d[4], d[6], "FRONTAL") for d in det_f] + \
+                           [(d[4], d[6], "TRASERA") for d in det_r]
 
         # Columna Izquierda: Apilar cámaras (640x960 px)
         left_column = np.vstack((frame_front, frame_rear))
 
-        # Panel Derecho: Vista 3D BEV con EGO CAR (640x960 px)
-        bev_panel = crear_panel_bev(960, 640, last_detecciones)
+        # Panel Derecho: Vista BEV tipo tablero de ajedrez (640x960 px)
+        bev_panel = crear_panel_bev(960, 640, detecciones_bev)
 
-        # Unir Columna Izquierda + Panel BEV para crear el Dashboard
         dashboard = np.hstack((left_column, bev_panel))
-
-        # Escalar ventana para adaptarse a la pantalla (1280x720)
         dashboard_resized = cv2.resize(dashboard, (1280, 720))
 
-        # Renderizar en la interfaz gráfica
+        # MEJORA: overlay de FPS de IA para monitoreo de latencia en vivo
+        cv2.putText(dashboard_resized, f"IA FPS: {ai_fps:.1f}", (10, 710),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
         cv2.imshow("BYD ADAS 3D Simulator", dashboard_resized)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
+            is_running = False
             break
 
+    is_running = False
+    time.sleep(0.1)
     cv2.destroyAllWindows()
     ecal_core.finalize()
 
