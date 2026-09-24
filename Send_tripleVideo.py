@@ -1,27 +1,33 @@
+import sys
+import os
 import cv2
 import time
+import numpy as np
 import ecal.core.core as ecal_core
 from ecal.core.publisher import ProtoPublisher
 
-from messages import trinocular_pb2
-from messages import imagen_pb2 as video_frame_pb2
+try:
+    from messages import imagen_pb2 as video_frame_pb2, trinocular_pb2
+except ImportError:
+    import imagen_pb2 as video_frame_pb2, trinocular_pb2
 
 ecal_core.initialize("Python Trinocular Publisher")
-
 pub = ProtoPublisher("trinocular_stream", trinocular_pb2.TripleVideoFrame)
 
-# Abrir las 3 cámaras (ajusta los índices según tu sistema)
-caps = [cv2.VideoCapture(0), cv2.VideoCapture(1), cv2.VideoCapture(2)]
+# --- CONFIGURACION DE CAMARAS FISICAS ---
+# Cambia estos numeros si tus camaras estan en otros puertos (ej. 0 y 1, o 0 y 4)
+PUERTO_FRONTAL = 0
+PUERTO_TRASERA = 2
+
+cap_front = cv2.VideoCapture(PUERTO_FRONTAL, cv2.CAP_V4L2)
+cap_rear = cv2.VideoCapture(PUERTO_TRASERA, cv2.CAP_V4L2)
 
 counter = 0
 quality = 80
 
-
 def fill_frame(msg_frame, frame, counter, quality):
     ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
-    if not ok:
-        return False
-
+    if not ok: return False
     h, w = frame.shape[:2]
     msg_frame.frame_data = buf.tobytes()
     msg_frame.width = w
@@ -34,42 +40,32 @@ def fill_frame(msg_frame, frame, counter, quality):
     msg_frame.is_keyframe = True
     return True
 
-
 msg = trinocular_pb2.TripleVideoFrame()
+print("Emisor eCAL Activo (Modo Multi-Camara Real)...")
 
 while ecal_core.ok():
-    frames = []
-    all_ok = True
-    for cap in caps:
-        ret, frame = cap.read()
-        if not ret:
-            all_ok = False
-            break
-        frames.append(frame)
+    # Leer Camara Frontal
+    ret_f, frame_f = cap_front.read() if cap_front.isOpened() else (False, None)
+    if not ret_f or frame_f is None:
+        frame_f = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.putText(frame_f, f"CAMARA FRONTAL ({PUERTO_FRONTAL}) NO DETECTADA", (30, 240),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    
+    # Leer Camara Trasera
+    ret_r, frame_r = cap_rear.read() if cap_rear.isOpened() else (False, None)
+    if not ret_r or frame_r is None:
+        frame_r = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.putText(frame_r, f"CAMARA TRASERA ({PUERTO_TRASERA}) NO DETECTADA", (30, 240),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-    if not all_ok:
-        break
-
-    # Mostrar cada stream
-    cv2.imshow("Left", frames[0])
-    cv2.imshow("Center", frames[1])
-    cv2.imshow("Right", frames[2])
-
-    # Llenar los 3 sub-mensajes
-    if not fill_frame(msg.left, frames[0], counter, quality):
-        continue
-    if not fill_frame(msg.center, frames[1], counter, quality):
-        continue
-    if not fill_frame(msg.right, frames[2], counter, quality):
-        continue
+    # NO USAMOS cv2.flip AQUI PARA MANTENER LA ORIENTACION ORIGINAL DE LAS CAMARAS REALES
+    fill_frame(msg.center, frame_f, counter, quality)
+    fill_frame(msg.right, frame_r, counter, quality)
 
     pub.send(msg)
     counter += 1
+    time.sleep(0.03)
 
-    if cv2.waitKey(1) == 27:  # ESC
-        break
-
-for cap in caps:
-    cap.release()
-cv2.destroyAllWindows()
+if cap_front.isOpened(): cap_front.release()
+if cap_rear.isOpened(): cap_rear.release()
 ecal_core.finalize()
